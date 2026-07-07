@@ -412,11 +412,19 @@ int ir_emit_riscv(ir_ctx *ctx, const char *name, FILE *f)
         case IR_END:
             {
                 ir_insn *parent = (op1 > 0) ? &ctx->ir_base[op1] : NULL;
+                /* 沿著 op1 往前追溯，跳過像 IR_CALL 這種帶控制流副作用但不是真正分支標記的節點 */
+                int trace_ref = op1;
+                int trace_guard = 0;
+                while (parent && parent->op != IR_IF_TRUE && parent->op != IR_IF_FALSE
+                    && parent->op1 > 0 && trace_guard < 32) {
+                    trace_ref = parent->op1;
+                    parent = &ctx->ir_base[trace_ref];
+                    trace_guard++;
+                }
                 int is_if_true  = parent && parent->op == IR_IF_TRUE;
                 int is_if_false = parent && parent->op == IR_IF_FALSE;
-
-                /* 先做合併賦值，且沿用跟 case IR_PHI 相同的暫存器池，避免之後被覆蓋 */
                 if (is_if_true || is_if_false) {
+                    int found_merge = 0;
                     for (ir_ref m = i+1; m < ctx->insns_count; m++) {
                         ir_insn *mi = &ctx->ir_base[m];
                         if (mi->op == IR_MERGE) {
@@ -496,17 +504,21 @@ int ir_emit_riscv(ir_ctx *ctx, const char *name, FILE *f)
         case IR_MERGE:
             fprintf(f, ".Lbb_%d:\n", i);
             {
-                ir_insn *p1 = (insn->op1>0) ? &ctx->ir_base[insn->op1] : NULL;
-                ir_insn *p2 = (insn->op2>0) ? &ctx->ir_base[insn->op2] : NULL;
                 ir_ref if_ref = 0;
-                if (p1 && p1->op == IR_IF_FALSE) if_ref = p1->op1;
-                else if (p2 && p2->op == IR_IF_FALSE) if_ref = p2->op1;
-                /* also check END→IF_FALSE */
-                if (!if_ref) {
-                    if (p1 && p1->op == IR_END && p1->op1>0 && ctx->ir_base[p1->op1].op == IR_IF_FALSE)
-                        if_ref = ctx->ir_base[p1->op1].op1;
-                    else if (p2 && p2->op == IR_END && p2->op1>0 && ctx->ir_base[p2->op1].op == IR_IF_FALSE)
-                        if_ref = ctx->ir_base[p2->op1].op1;
+                ir_ref candidates[2] = {insn->op1, insn->op2};
+                for (int c = 0; c < 2 && !if_ref; c++) {
+                    ir_ref r = candidates[c];
+                    int guard = 0;
+                    while (r > 0 && guard < 32) {
+                        ir_insn *ri = &ctx->ir_base[r];
+                        if (ri->op == IR_IF_FALSE) {
+                            if_ref = ri->op1;
+                            break;
+                        }
+                        if (ri->op1 <= 0) break;
+                        r = ri->op1;
+                        guard++;
+                    }
                 }
                 if (if_ref) fprintf(f, ".Lend_%d:\n", if_ref);
             }
@@ -751,6 +763,61 @@ int ir_emit_riscv(ir_ctx *ctx, const char *name, FILE *f)
         case IR_VSTORE:
         case IR_VLOAD:
             break;
+
+        case IR_CALL: {
+            const char *fname = "/*unknown_func*/";
+            if (IR_IS_CONST_REF(op2)) {
+                ir_insn *func_insn = &ctx->ir_base[op2];
+                if (func_insn->op == IR_FUNC) {
+                    fname = ir_get_str(ctx, func_insn->val.name);
+                }
+            }
+
+            static const char *fargs[] = {"fa0","fa1","fa2","fa3","fa4","fa5","fa6","fa7"};
+            static const char *iargs[] = {"a0","a1","a2","a3","a4","a5","a6","a7"};
+            int freg_idx = 0, ireg_idx = 0;
+            int n = insn->inputs_count;
+            for (int j = 3; j <= n; j++) {
+                ir_ref arg = ir_insn_op(insn, j);
+                if (arg > 0 && !IR_IS_CONST_REF(arg) && ctx->ir_base[arg].op == IR_ARGVAL) {
+                    arg = ctx->ir_base[arg].op1;
+                }
+                int arg_is_float;
+                if (IR_IS_CONST_REF(arg)) {
+                    arg_is_float = (ctx->ir_base[arg].type == IR_FLOAT || ctx->ir_base[arg].type == IR_DOUBLE);
+                } else {
+                    arg_is_float = (ctx->ir_base[arg].type == IR_FLOAT || ctx->ir_base[arg].type == IR_DOUBLE);
+                }
+                if (arg_is_float) {
+                    int is_d = (ctx->ir_base[arg].type == IR_DOUBLE);
+                    const char *r = prep_flt_full(ctx, arg, is_d);
+                    if (strcmp(r, fargs[freg_idx]) != 0)
+                        fprintf(f, "\t%s\t%s, %s\n", is_d?"fmv.d":"fmv.s", fargs[freg_idx], r);
+                    freg_idx++;
+                } else {
+                    const char *r = prep_int_full(ctx, arg);
+                    if (strcmp(r, iargs[ireg_idx]) != 0)
+                        fprintf(f, "\tmv\t%s, %s\n", iargs[ireg_idx], r);
+                    ireg_idx++;
+                }
+            }
+
+            fprintf(f, "\tcall\t%s\n", fname);
+
+            if (insn->type != IR_VOID) {
+                if (insn->type == IR_FLOAT || insn->type == IR_DOUBLE) {
+                    int is_d = (insn->type == IR_DOUBLE);
+                    dst = alloc_freg(i);
+                    if (strcmp(dst, "fa0") != 0)
+                        fprintf(f, "\t%s\t%s, fa0\n", is_d?"fmv.d":"fmv.s", dst);
+                } else {
+                    dst = alloc_reg(i);
+                    if (strcmp(dst, "a0") != 0)
+                        fprintf(f, "\tmv\t%s, a0\n", dst);
+                }
+            }
+            break;
+        }
 
         default:
             fprintf(f, "\t# skip op=%d ref=%d\n", insn->op, i);
