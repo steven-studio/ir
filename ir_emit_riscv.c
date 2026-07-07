@@ -410,21 +410,12 @@ int ir_emit_riscv(ir_ctx *ctx, const char *name, FILE *f)
             break;
 
         case IR_END:
-            /* if inside if-true branch → jump over false branch */
             {
                 ir_insn *parent = (op1 > 0) ? &ctx->ir_base[op1] : NULL;
-                if (parent && parent->op == IR_IF_TRUE) {
-                    ir_ref if_ref = parent->op1;
-                    for (ir_ref m = i+1; m < ctx->insns_count; m++) {
-                        if (ctx->ir_base[m].op == IR_MERGE) {
-                            fprintf(f, "\tj\t.Lend_%d\n", if_ref);
-                            break;
-                        }
-                    }
-                }
-                /* if/else PHI update for this branch */
                 int is_if_true  = parent && parent->op == IR_IF_TRUE;
                 int is_if_false = parent && parent->op == IR_IF_FALSE;
+
+                /* 先做合併賦值，且沿用跟 case IR_PHI 相同的暫存器池，避免之後被覆蓋 */
                 if (is_if_true || is_if_false) {
                     for (ir_ref m = i+1; m < ctx->insns_count; m++) {
                         ir_insn *mi = &ctx->ir_base[m];
@@ -435,13 +426,30 @@ int ir_emit_riscv(ir_ctx *ctx, const char *name, FILE *f)
                                 ir_ref val = is_if_true ? pi->op2 : pi->op3;
                                 if (pi->type == IR_FLOAT || pi->type == IR_DOUBLE) {
                                     int is_d = (pi->type == IR_DOUBLE);
-                                    const char *pdst = alloc_freg(p);
-                                    emit_fref(val, pdst, is_d, ctx);
+                                    if (!phi_reg_map[p]) {
+                                        phi_reg_map[p] = fphi_regs[fphi_next % NUM_FPHI_REGS];
+                                        fphi_next++;
+                                    }
+                                    emit_fref(val, phi_reg_map[p], is_d, ctx);
                                 } else {
-                                    const char *pdst = alloc_reg(p);
-                                    emit_ref(val, pdst, ctx);
+                                    if (!phi_reg_map[p]) {
+                                        phi_reg_map[p] = phi_regs[phi_next % NUM_PHI_REGS];
+                                        phi_next++;
+                                    }
+                                    emit_ref(val, phi_reg_map[p], ctx);
                                 }
                             }
+                            break;
+                        }
+                    }
+                }
+
+                /* 合併賦值做完了，才跳過 else 分支 */
+                if (is_if_true) {
+                    ir_ref if_ref = parent->op1;
+                    for (ir_ref m = i+1; m < ctx->insns_count; m++) {
+                        if (ctx->ir_base[m].op == IR_MERGE) {
+                            fprintf(f, "\tj\t.Lend_%d\n", if_ref);
                             break;
                         }
                     }
